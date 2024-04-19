@@ -1,79 +1,45 @@
-<p align="center">
-  <img width="500" height="140" alt="CacheLib" src="website/static/img/CacheLib-Logo-Large-transp.png">
-</p>
+# Z-CacheLib
 
-# CacheLib
-
-Pluggable caching engine to build and scale high performance cache services. See
-[www.cachelib.org](https://cachelib.org) for documentation and more information.
-
-
-## What is CacheLib ?
-
-CacheLib is a C++ library providing in-process high performance caching
-mechanism. CacheLib provides a thread safe API to build high throughput,
-low overhead caching services, with built-in ability to leverage
-DRAM and SSD caching transparently.
-
-
-## Performance benchmarking
-
-CacheLib provides a standalone executable `CacheBench` that can be used to
-evaluate the performance of heuristics and caching hardware platforms against
-production workloads. Additionally `CacheBench` enables stress testing
-implementation and design changes to CacheLib to catch correctness and
-performance issues.
-
-See [CacheBench](https://cachelib.org/docs/Cache_Library_User_Guides/Cachebench_Overview) for usage details
-and examples.
-
-## Versioning
-CacheLib has one single version number `facebook::cachelib::kCachelibVersion` that can be located at [CacheVersion.h](https://github.com/facebook/CacheLib/blob/main/cachelib/allocator/CacheVersion.h#L31). This version number must be incremented when incompatible changes are introduced. A change is incompatible if it could cause a complication failure due to removing public API or requires dropping the cache. Details about the compatility information when the version number increases can be found in the [changelog](https://github.com/facebook/CacheLib/blob/main/CHANGELOG.md).
-
+Project is cloned from <https://github.com/facebook/CacheLib>
 
 ## Building and installation
 
-CacheLib provides a build script which prepares and installs all
-dependencies and prerequisites, then builds CacheLib.
-The build script has been tested to work on CentOS 8,
-Ubuntu 18.04, and Debian 10.
+1. You should install [libzbd](https://github.com/westerndigitalcorporation/libzbd) and [libexplain](https://packages.ubuntu.com/jammy/libexplain-dev) at first.
 
-```sh
-git clone https://github.com/facebook/CacheLib
-cd CacheLib
-./contrib/build.sh -d -j -v
+2. Follow the steps provided by [CacheLib](https://cachelib.org/)
+
+```bash
+git clone https://github.com/sosp24-anonymous/Z-CacheLib
+cd Z-CacheLib
+./contrib/build.sh -j -T
 
 # The resulting library and executables:
 ./opt/cachelib/bin/cachebench --help
 ```
 
-Re-running `./contrib/build.sh` will update CacheLib and its dependencies
-to their latest versions and rebuild them.
+## Run CacheBench
 
-See [build](https://cachelib.org/docs/installation/installation) for more details about
-the building and installation process.
+You should change device path in config file appropiately before you run the CacheBench.
 
+```bash
+./opt/cachelib/bin/cachebench --json_test_config ./configs/kvcache_l2_wc/config.json --progress_stats_file=/tmp/mc-l2-reg.log --logging=INFO
+```
 
-## Contributing
+More configuration files can be found in `./configs/`.
 
-We'd love to have your help in making CacheLib better. If you're interested,
-please read our [guide to contributing](CONTRIBUTING.md)
+There are some new config for Z-CacheLib:
 
+1. `navyUseZns`: indicate the device is a ZNS SSD.
+2. `navyZnsZoneNum`: set the number of zone to use.
+3. `navyZnsDrop`: enable `ZNS Drop` feature.
+4. `navyZnsDirect`: enable `ZNS Direct` feature.
 
+And there are detials you should notice:
 
-## License
+If you are using `ZNS Direct`:
 
-CacheLib is *apache* licensed, as found in the [LICENSE](LICENSE) file.
+1. the `navyZnsZoneNum` should be `0`.
+2. the `deviceMaxWriteSize` should be `262144`.
+3. the `navyRegionSizeMB` should be the size of zone (`1077` in ZN540).
 
-
-
-## Reporting and Fixing Security Issues
-
-Please do not open GitHub issues or pull requests - this makes the problem
-immediately visible to everyone, including malicious actors. Security issues in
-CacheLib can be safely reported via Facebook's Whitehat Bug Bounty program:
-
-https://www.facebook.com/whitehat
-
-Facebook's security team will triage your report and determine whether or not is
-it eligible for a bounty under our program.
+If you are using `ZNS Middle` or `ZNS Drop`, the `deviceMaxWriteSize` should be `0`.

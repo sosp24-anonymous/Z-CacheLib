@@ -14,30 +14,34 @@
  * limitations under the License.
  */
 
-#include "cachelib/navy/block_cache/LruPolicy.h"
+#include "cachelib/navy/zone_cache/ZLruPolicy.h"
 
 #include <folly/Format.h>
 #include <folly/logging/xlog.h>
 
+#include <cassert>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 
 #include "cachelib/navy/common/Utils.h"
+#include "cachelib/shm/SysVShmSegment.h"
 
 namespace facebook {
 namespace cachelib {
 namespace navy {
 
-constexpr std::chrono::seconds LruPolicy::kEstimatorWindow;
+constexpr std::chrono::seconds ZLruPolicy::kEstimatorWindow;
 
-LruPolicy::LruPolicy(uint32_t expectedNumRegions)
+ZLruPolicy::ZLruPolicy(uint32_t expectedNumRegions)
     : secSinceInsertionEstimator_{kEstimatorWindow},
       secSinceAccessEstimator_{kEstimatorWindow},
       hitsEstimator_{kEstimatorWindow} {
   array_.reserve(expectedNumRegions);
-  XLOGF(INFO, "LRU policy: expected {} regions", expectedNumRegions);
+  XLOGF(INFO, "zLRU policy: expected {} regions", expectedNumRegions);
 }
 
-void LruPolicy::touch(RegionId rid) {
+void ZLruPolicy::touch(RegionId rid) {
   XDCHECK(rid.valid());
   auto i = rid.index();
   std::lock_guard<std::mutex> lock{mutex_};
@@ -47,12 +51,29 @@ void LruPolicy::touch(RegionId rid) {
   if (array_[i].inList()) {
     array_[i].hits++;
     array_[i].lastUpdateTime = getSteadyClockSeconds();
+    auto iprev = array_[i].prev;
     unlink(i);
     linkAtHead(i);
+
+    if (tset.count(i)) {
+      XLOGF(DBG, "touch {}", i);
+      if (tpointer == i) {
+        tpointer = array_[iprev].next;
+        XLOGF(DBG, "tpointer ({}) is moved, new tp is {}", i, tpointer);
+      }
+      if (rpointer == i) {
+        rpointer = iprev;
+        XLOGF(DBG, "rpointer ({}) is moved, new rp is {}", i, rpointer);
+      }
+      eraseTSet(i);
+      insertTSet();
+      XLOGF(DBG, "touch erase region {}", i);
+    }
+    // checkTSet();
   }
 }
 
-void LruPolicy::track(const Region& region) {
+void ZLruPolicy::track(const Region& region) {
   auto rid = region.id();
   XDCHECK(rid.valid());
   auto i = rid.index();
@@ -60,6 +81,14 @@ void LruPolicy::track(const Region& region) {
   if (i >= array_.size()) {
     array_.resize(i + 1);
   }
+
+  // capcity
+  // top down, tail 0.3
+  const int top_threshold = (int) (top_window_alpha * array_.capacity());
+  if (array_.size() == top_threshold) {
+    tpointer = head_;
+  }
+
   array_[i].hits = 0;
   array_[i].creationTime = getSteadyClockSeconds();
   array_[i].lastUpdateTime = getSteadyClockSeconds();
@@ -68,7 +97,7 @@ void LruPolicy::track(const Region& region) {
   }
 }
 
-RegionId LruPolicy::evict() {
+RegionId ZLruPolicy::evict() {
   uint32_t retRegion{kInvalidIndex};
   uint32_t secsSinceAccess{0};
   uint32_t secsSinceCreate{0};
@@ -80,10 +109,20 @@ RegionId LruPolicy::evict() {
       return RegionId{};
     }
     retRegion = tail_;
+    XLOGF(DBG, "evcit region {}", retRegion);
     secsSinceCreate = array_[tail_].secondsSinceCreation().count();
     secsSinceAccess = array_[tail_].secondsSinceAccess().count();
     hits = array_[tail_].hits;
+    if (rpointer == kInvalidIndex or rpointer == retRegion) {
+      rpointer = array_[tail_].prev;
+    }
+
     unlink(tail_);
+
+    if (tset.count(retRegion)) {
+      eraseTSet(retRegion);
+    }
+    insertTSet();
   }
 
   secSinceInsertionEstimator_.trackValue(secsSinceCreate);
@@ -92,8 +131,7 @@ RegionId LruPolicy::evict() {
   return RegionId{retRegion};
 }
 
-
-RegionId LruPolicy::evictAt(const RegionId &regionId) {
+RegionId ZLruPolicy::evictAt(const RegionId &regionId) {
   uint32_t retRegion{kInvalidIndex};
   uint32_t secsSinceAccess{0};
   uint32_t secsSinceCreate{0};
@@ -113,7 +151,17 @@ RegionId LruPolicy::evictAt(const RegionId &regionId) {
     secsSinceCreate = array_[i].secondsSinceCreation().count();
     secsSinceAccess = array_[i].secondsSinceAccess().count();
     hits = array_[i].hits;
+    auto iprev = array_[i].prev;
     unlink(i);
+
+    if (tset.count(i)) {
+      if (tpointer == i) {
+        tpointer = array_[iprev].next;
+        XLOGF(DBG, "tpointer ({}) is moved, new tp is {}", i, tpointer);
+      }
+      eraseTSet(i);
+      insertTSet();
+    }
   }
 
   secSinceInsertionEstimator_.trackValue(secsSinceCreate);
@@ -122,14 +170,14 @@ RegionId LruPolicy::evictAt(const RegionId &regionId) {
   return RegionId{retRegion};
 }
 
-void LruPolicy::reset() {
+void ZLruPolicy::reset() {
   std::lock_guard<std::mutex> lock{mutex_};
   array_.clear();
   head_ = kInvalidIndex;
   tail_ = kInvalidIndex;
 }
 
-void LruPolicy::unlink(uint32_t i) {
+void ZLruPolicy::unlink(uint32_t i) {
   auto& node = array_[i];
   XDCHECK_NE(tail_, kInvalidIndex);
   if (tail_ == i) {
@@ -149,7 +197,7 @@ void LruPolicy::unlink(uint32_t i) {
   node.prev = kInvalidIndex;
 }
 
-void LruPolicy::linkAtHead(uint32_t i) {
+void ZLruPolicy::linkAtHead(uint32_t i) {
   if (i != head_) {
     if (head_ != kInvalidIndex) {
       array_[head_].prev = i;
@@ -162,7 +210,7 @@ void LruPolicy::linkAtHead(uint32_t i) {
   }
 }
 
-void LruPolicy::linkAtTail(uint32_t i) {
+void ZLruPolicy::linkAtTail(uint32_t i) {
   if (i != tail_) {
     if (tail_ != kInvalidIndex) {
       array_[tail_].next = i;
@@ -175,16 +223,30 @@ void LruPolicy::linkAtTail(uint32_t i) {
   }
 }
 
-size_t LruPolicy::memorySize() const {
+void ZLruPolicy::linkAtReorder(uint32_t i) {
+  if (i != tail_) {
+    // if (tail_ != kInvalidIndex) {
+    // }
+    auto rnext = array_[rpointer].next = i;
+
+    array_[rnext].prev = i;
+    array_[i].next = rnext;
+
+    array_[rpointer].next = i;
+    array_[i].prev = rpointer;
+  }
+}
+
+size_t ZLruPolicy::memorySize() const {
   return sizeof(*this) + sizeof(ListNode) * array_.capacity();
 }
 
-void LruPolicy::dump(uint32_t n) const {
+void ZLruPolicy::dump(uint32_t n) const {
   dumpList("head", n, head_, &ListNode::next);
   dumpList("tail", n, tail_, &ListNode::prev);
 }
 
-void LruPolicy::dumpList(const char* tag,
+void ZLruPolicy::dumpList(const char* tag,
                          uint32_t n,
                          uint32_t first,
                          uint32_t ListNode::*link) const {
@@ -213,7 +275,7 @@ void LruPolicy::dumpList(const char* tag,
   XLOG(ERR, buf);
 }
 
-void LruPolicy::getCounters(const CounterVisitor& v) const {
+void ZLruPolicy::getCounters(const CounterVisitor& v) const {
   secSinceInsertionEstimator_.visitQuantileEstimator(
       v, "navy_bc_lru_secs_since_insertion");
   secSinceAccessEstimator_.visitQuantileEstimator(
@@ -221,12 +283,12 @@ void LruPolicy::getCounters(const CounterVisitor& v) const {
   hitsEstimator_.visitQuantileEstimator(v, "navy_bc_lru_region_hits_estimate");
 }
 
-void LruPolicy::persist(RecordWriter& rw) const {
+void ZLruPolicy::persist(RecordWriter& rw) const {
   std::ignore = rw;
   throw std::runtime_error("Not Implemented.");
 }
 
-void LruPolicy::recover(RecordReader& rr) {
+void ZLruPolicy::recover(RecordReader& rr) {
   std::ignore = rr;
   throw std::runtime_error("Not Implemented.");
 }

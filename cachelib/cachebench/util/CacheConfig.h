@@ -17,6 +17,7 @@
 #pragma once
 
 #include <any>
+#include <cstdint>
 
 #include "cachelib/allocator/CacheAllocator.h"
 #include "cachelib/allocator/RebalanceStrategy.h"
@@ -107,6 +108,22 @@ struct CacheConfig : public JSONConfig {
   // not computed. This can be specified as nvme1n1 or nvme1n2 etc, confirming
   // to be a physical device identifier;
   std::vector<std::string> writeAmpDeviceList{};
+
+  // Navy specific: zns device
+  bool navyUseZns{false};
+
+  // Navy specific: zns direct
+  bool navyZnsDirect{false};
+
+  // Navy specific: use reset to process garbage collection by evicting extra data
+  bool navyZnsDrop{false};
+
+  // Navy specific: use zLRU
+  bool navyZLRU{false};
+
+  // Navy specific: setup the zone number
+  // if 0, we should use all zones in ZNS SSD
+  uint32_t navyZnsZoneNum{0};
 
   // Navy specific: block size in bytes
   uint64_t navyBlockSize{512};

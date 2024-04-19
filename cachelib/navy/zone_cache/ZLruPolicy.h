@@ -16,30 +16,39 @@
 
 #pragma once
 
+#include <folly/logging/xlog.h>
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
 #include "cachelib/common/PercentileStats.h"
 #include "cachelib/navy/block_cache/EvictionPolicy.h"
 #include "cachelib/navy/common/Utils.h"
+#include "cachelib/navy/zone_cache/ZRegionManager.h"
+#include "cachelib/shm/SysVShmSegment.h"
 
 namespace facebook {
 namespace cachelib {
 namespace navy {
 // LRU policy with optional deferred LRU insert
-class LruPolicy final : public EvictionPolicy {
+class ZLruPolicy final : public EvictionPolicy {
  public:
   // Constructs LRU policy.
   // @expectedNumRegions is a hint how many regions to expect in LRU.
-  explicit LruPolicy(uint32_t expectedNumRegions);
+  explicit ZLruPolicy(uint32_t expectedNumRegions);
 
-  LruPolicy(const LruPolicy&) = delete;
-  LruPolicy& operator=(const LruPolicy&) = delete;
+  ZLruPolicy(const ZLruPolicy&) = delete;
+  ZLruPolicy& operator=(const ZLruPolicy&) = delete;
 
-  ~LruPolicy() override {}
+  ~ZLruPolicy() override {}
+
+  void setRegionManager(ZRegionManager *regionManager) {
+    this->regionManager_ = std::shared_ptr<ZRegionManager>(regionManager);
+  };
 
   // Records the hit of the region.
   void touch(RegionId rid) override;
@@ -50,6 +59,7 @@ class LruPolicy final : public EvictionPolicy {
   // Evicts the least recently used region and stops tracking.
   RegionId evict() override;
 
+  // Manually, evicts a region and stops tracking.
   RegionId evictAt(const RegionId &regionId) override;
 
   // Resets LRU policy to the initial state.
@@ -95,17 +105,105 @@ class LruPolicy final : public EvictionPolicy {
   void unlink(uint32_t i);
   void linkAtHead(uint32_t i);
   void linkAtTail(uint32_t i);
+  void linkAtReorder(uint32_t i);
+
   void dump(uint32_t n) const;
   void dumpList(const char* tag,
                 uint32_t n,
                 uint32_t first,
                 uint32_t ListNode::*link) const;
 
+
+  void eraseTSet(uint32_t rid) {
+    tset.erase(rid);
+    regionManager_->lockZoneMutex();
+    regionManager_->deleteTRegion(rid);
+    regionManager_->unlockZoneMutex();
+  }
+
+  void checkTSet() {
+    auto t = tpointer;
+    int cnt = 0;
+    while (t != kInvalidIndex) {
+      t = array_[t].next;
+      cnt++;
+    }
+  }
+
+  void insertTSet() {
+    XCHECK_NE(tpointer, head_);
+    tpointer = array_[tpointer].prev;
+
+    XCHECK_NE(tpointer, kInvalidIndex);
+    XLOGF(DBG, "insert region {}", tpointer);
+    regionManager_->lockZoneMutex();
+    tset.insert(tpointer);
+    regionManager_->pushTRegion(tpointer);
+
+    auto zid = regionManager_->getZoneId(tpointer);
+    auto &s = regionManager_->getRegionIds(zid);
+    if (zid == kInvalidKey) {
+      regionManager_->unlockZoneMutex();
+      return;
+    }
+
+    // XLOGF(INFO, "tset size {} for zone {}", s.size() + regionManager_->getNrEvcited(zid), zid);
+    if (s.size() + regionManager_->getNrEvcited(zid) > top_victim_threshold) {
+      // move to next tset item
+      auto tp= array_[tpointer].prev;
+      // push all entries to tail
+      if (s.size() > 1) {
+        XLOGF(INFO, "push all entries to tail. zone={} nr={}, ev={}", zid, s.size(), regionManager_->getNrEvcited(zid));
+      }
+      // XLOGF(DBG, "before: {} -> {} -> {} -> {}", tp, tpointer, array_[tpointer].next, array_[array_[tpointer].next].next);
+
+      for (auto x : s) {
+        if (tset.count(x) == 0) {
+          XLOGF(DBG, "x is not in tset {}", x);
+          throw std::logic_error("tset is wrong in push");
+        }
+        if (array_[x].inList()) {
+          XLOGF(DBG, "push region {}", x);
+          // push to back
+          unlink(x);
+          linkAtTail(x);
+          // linkAtReorder(x);
+        } else {
+          XLOGF(DBG, "region {} is not in list", x);
+        }
+      }
+      s.clear();
+      tpointer = array_[tp].next;
+      // XLOGF(DBG, "after: {} -> {} -> {} -> {}", tp, tpointer, array_[tpointer].next, array_[array_[tpointer].next].next);
+    }
+    regionManager_->unlockZoneMutex();
+  }
+
   static constexpr std::chrono::seconds kEstimatorWindow{5};
 
+  static constexpr double top_window_alpha = 0.3;
+  static constexpr uint32_t top_victim_threshold = 48;
+
   std::vector<ListNode> array_;
+
   uint32_t head_{kInvalidIndex};
   uint32_t tail_{kInvalidIndex};
+  // top down
+  uint32_t tpointer{kInvalidIndex};
+  // bottom up
+  uint32_t bpointer{kInvalidIndex};
+
+  // reorder pointer
+  uint32_t rpointer{kInvalidIndex};
+
+  std::vector<uint32_t> ttail;
+
+  std::set<uint32_t> tset;
+
+  // based on zone
+  std::shared_ptr<ZRegionManager> regionManager_;
+
+  // bottwn up
   mutable std::mutex mutex_;
 
   // various counters that are populated when we evict a region.
